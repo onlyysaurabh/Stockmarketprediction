@@ -188,8 +188,8 @@ def train_arima_model(train_series, order):
         return None
 
 # --- 7. Evaluate Model on Test Set (Walk-Forward Validation) ---
-def evaluate_model(model_fit, train_series, test_series, original_series, diff_order, stock_symbol, order):
-    """Evaluates the trained ARIMA model using walk-forward validation."""
+def evaluate_model(model_fit, train_series, test_series, original_series, diff_order, stock_symbol, order, evaluation_results_collection, start_date, end_date):
+    """Evaluates the trained ARIMA model using walk-forward validation and stores results in MongoDB."""
     history = list(train_series)
     predictions = []
     for t in tqdm(range(len(test_series)), desc="Walk-Forward Validation"): # Added tqdm progress bar
@@ -259,7 +259,7 @@ def evaluate_model(model_fit, train_series, test_series, original_series, diff_o
     plt.figure(figsize=(12, 6))
     plt.plot(actuals_original_scale, label='Actual Prices', color='blue')
     plt.plot(predictions_original_scale, label='Predicted Prices', color='red')
-    plt.title('ARIMA Model - Actual vs Predicted Stock Prices')
+    plt.title(f'ARIMA Model for {stock_symbol} - Actual vs Predicted Stock Prices') # Include stock symbol in title
     plt.xlabel('Time')
     plt.ylabel('Stock Price')
     plt.legend()
@@ -277,6 +277,28 @@ def evaluate_model(model_fit, train_series, test_series, original_series, diff_o
     except Exception as e:
         print(f"Error saving model to {model_path}: {e}")
 
+    # --- Store Evaluation Results in MongoDB ---
+    evaluation_data = {
+        "stock_symbol": stock_symbol,
+        "start_date": start_date.isoformat(),
+        "end_date": end_date.isoformat(),
+        "arima_order": str(order),
+        "rmse": rmse_val,
+        "mae": mae_val,
+        "mape": mape_val,
+        "accuracy": accuracy_score(actual_directions, predicted_directions),
+        "sensitivity": sensitivity,
+        "specificity": specificity,
+        "precision": precision,
+        "f1_score": f1,
+        "confusion_matrix": cm.tolist() # Store confusion matrix as list for MongoDB
+    }
+    try:
+        evaluation_results_collection.insert_one(evaluation_data)
+        print(f"Evaluation results for {stock_symbol} stored in MongoDB.")
+    except Exception as e:
+        print(f"Error storing evaluation results in MongoDB: {e}")
+
 
 # --- Main Program ---
 if __name__ == "__main__":
@@ -284,49 +306,78 @@ if __name__ == "__main__":
     mongo_uri = "mongodb://localhost:27017/"
     db_name = "stock_market_db"
     collection_name = "stock_data"
+    evaluation_collection_name = "arima_evaluation_results" # Collection to store evaluation results
 
-    stock_symbol_to_predict = "AAPL"
     price_field_to_use = 'Close'
 
     # --- Date Range for Training and Prediction ---
     start_date_str = "2020-02-25"  # Original start date
-    end_date_str = "2025-02-25"   # Original end date
+    end_date_str = "2023-02-25"   # Modified end date to reduce compute
 
     start_date = datetime.strptime(start_date_str, "%Y-%m-%d").date()
     end_date = datetime.strptime(end_date_str, "%Y-%m-%d").date()
 
-
+    # --- Load Stock Symbols from CSV ---
+    stocks_file = "stocks.csv" # Ensure stocks.csv is in the same directory or provide full path
     try:
-        # 1. Load Data from MongoDB with Date Range and Feature Engineering
-        stock_series, feature_df = load_data_from_mongodb(mongo_uri, db_name, collection_name, stock_symbol_to_predict, price_field_to_use, start_date, end_date, feature_engineering=True)
+        stocks_df = pd.read_csv(stocks_file)
+        stock_symbols = stocks_df['Symbol'].tolist()
+    except FileNotFoundError:
+        print(f"Error: {stocks_file} not found. Please make sure it exists in the same directory.")
+        exit()
+    except KeyError:
+        print(f"Error: 'Symbol' column not found in {stocks_file}. Please check the CSV file format.")
+        exit()
 
-        # 2. Handle Stationarity (using 'Close' price series)
-        stationary_series, diff_order = make_stationary(stock_series.copy())
-        if stationary_series is None:
-            print("Failed to make series stationary. Exiting.")
-            exit()
+    client = None # Initialize client outside the loop
+    try:
+        client = MongoClient(mongo_uri)
+        db = client[db_name]
+        evaluation_results_collection = db[evaluation_collection_name]
 
-        # 3. Split Data (split the feature DataFrame as well to keep features aligned with target 'Close' price)
-        train_data, test_data = train_test_split(stationary_series)
-        original_train, original_test = train_test_split(stock_series) # Keep original_train, original_test although not directly used.
+        for stock_symbol_to_predict in stock_symbols:
+            print(f"\n--- Processing Stock: {stock_symbol_to_predict} ---")
 
-        feature_train_df, feature_test_df = train_test_split(feature_df) # Split the feature-rich DataFrame
+            try:
+                # 1. Load Data from MongoDB with Date Range and Feature Engineering
+                stock_series, feature_df = load_data_from_mongodb(mongo_uri, db_name, collection_name, stock_symbol_to_predict, price_field_to_use, start_date, end_date, feature_engineering=True)
 
-        # 4. Automatically Set ARIMA Parameters (using AIC for stationary series)
-        best_order = get_auto_arima_params(train_data, max_p=3, max_q=3) # You can adjust max_p and max_q
+                # 2. Handle Stationarity (using 'Close' price series)
+                stationary_series, diff_order = make_stationary(stock_series.copy())
+                if stationary_series is None:
+                    print("Failed to make series stationary. Skipping stock.")
+                    continue # Skip to the next stock symbol
 
-        # 5. Train ARIMA Model
-        arima_model_fit = train_arima_model(train_data, best_order)
-        if arima_model_fit is None:
-            exit()
+                # 3. Split Data (split the feature DataFrame as well to keep features aligned with target 'Close' price)
+                train_data, test_data = train_test_split(stationary_series)
+                original_train, original_test = train_test_split(stock_series) # Keep original_train, original_test although not directly used.
+                feature_train_df, feature_test_df = train_test_split(feature_df) # Split feature-rich DataFrame
 
-        # 6. Evaluate Model (includes classification metrics and model saving)
-        evaluate_model(arima_model_fit, train_data, test_data, stock_series, diff_order, stock_symbol_to_predict, best_order)
+                # 4. Automatically Set ARIMA Parameters (using AIC for stationary series)
+                best_order = get_auto_arima_params(train_data, max_p=3, max_q=3) # You can adjust max_p and max_q
+
+                # 5. Train ARIMA Model
+                arima_model_fit = train_arima_model(train_data, best_order)
+                if arima_model_fit is None:
+                    print("ARIMA model training failed. Skipping stock.")
+                    continue # Skip to the next stock symbol
+
+                # 6. Evaluate Model (includes classification metrics and model saving & result storing)
+                evaluate_model(arima_model_fit, train_data, test_data, stock_series, diff_order, stock_symbol_to_predict, best_order, evaluation_results_collection, start_date, end_date)
+
+            except ValueError as ve:
+                print(f"Value Error for {stock_symbol_to_predict}: {ve}. Skipping stock.")
+                continue # Skip to the next stock symbol
+            except Exception as e:
+                print(f"An error occurred for {stock_symbol_to_predict}: {e}. Skipping stock.")
+                continue # Skip to the next stock symbol
 
 
-    except FileNotFoundError as e:
-        print(f"File Error: {e}")
-    except ValueError as e:
-        print(f"Value Error: {e}")
+    except pymongo.errors.ConnectionFailure as e:
+        print(f"Could not connect to MongoDB: {e}")
     except Exception as e:
-        print(f"An error occurred: {e}")
+        print(f"An unexpected error occurred in main program: {e}")
+    finally:
+        if client:
+            client.close()
+    print("\n--- Stock Price Prediction and Evaluation Completed for all symbols. ---")

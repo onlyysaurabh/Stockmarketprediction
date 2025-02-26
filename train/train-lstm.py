@@ -9,6 +9,8 @@ from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint
 from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score, accuracy_score, confusion_matrix, classification_report, recall_score
 import os
 import datetime
+import pymongo
+from pymongo import MongoClient
 
 def calculate_technical_indicators(df, short_window=20, long_window=50, lag_days=1):
     """
@@ -119,20 +121,21 @@ def evaluate_classification(y_true, y_pred):
     print("  Confusion Matrix:\n", conf_matrix)
     print(f"  Sensitivity (Recall or True Positive Rate): {sensitivity:.2f}") # Added Sensitivity
     print(f"  Specificity (True Negative Rate): {specificity:.2f}")     # Added Specificity
-    print(f"  Precision: {precision:.2f}")                                   # Added Precision
-    print(f"  F1-Score: {f1:.2f}")                                            # Added F1-Score
+    print(f"  Precision: {precision:.2f}")       # Added Precision
+    print(f"  F1-Score: {f1:.2f}")          # Added F1-Score
     print("  Classification Report:\n", class_report)
     return accuracy, conf_matrix, class_report, sensitivity, specificity, precision, f1 # Return additional metrics
 
 
-def train_lstm_model(symbol, start_date, end_date, seq_length=60, short_window=20, long_window=50, lag_days=1, lstm_units=50, dropout_rate=0.2, epochs=50, batch_size=32, patience=10):
+def train_lstm_model(symbol, start_date, end_date, evaluation_results_collection, seq_length=60, short_window=20, long_window=50, lag_days=1, lstm_units=50, dropout_rate=0.2, epochs=50, batch_size=32, patience=10):
     """
-    Trains and evaluates LSTM models for regression and classification.
+    Trains and evaluates LSTM models for regression and classification and stores results in MongoDB.
 
     Args:
         symbol: Stock symbol (e.g., "AAPL").
         start_date: Start date for data fetching (YYYY-MM-DD).
         end_date: End date for data fetching (YYYY-MM-DD).
+        evaluation_results_collection: MongoDB collection to store results.
         seq_length: Sequence length for LSTM input.
         short_window:  Short moving average window.
         long_window: Long moving average window.
@@ -144,7 +147,8 @@ def train_lstm_model(symbol, start_date, end_date, seq_length=60, short_window=2
         patience:  Patience for EarlyStopping
 
     Returns:
-        None (saves models and prints evaluation results)
+        evaluation_metrics (dict): Dictionary containing evaluation metrics.
+        None if data download or processing fails.
     """
 
     # --- 1. Data Fetching and Preprocessing ---
@@ -152,14 +156,14 @@ def train_lstm_model(symbol, start_date, end_date, seq_length=60, short_window=2
         data = yf.download(symbol, start=start_date, end=end_date)
         if data.empty:
             print(f"No data found for {symbol} between {start_date} and {end_date}.")
-            return
+            return None # Indicate failure
     except Exception as e:
         print(f"Error downloading data for {symbol}: {e}")
-        return
+        return None # Indicate failure
 
     data = calculate_technical_indicators(data, short_window, long_window, lag_days)
     if data.empty: # check if indicators were calculated correctly
-        return
+        return None # Indicate failure
 
     # Feature Selection and Scaling
     features = ['Close', 'SMA_Short', 'SMA_Long', 'EMA_Short', 'EMA_Long', f'Lagged_Return_{lag_days}']  # Include indicators
@@ -180,11 +184,6 @@ def train_lstm_model(symbol, start_date, end_date, seq_length=60, short_window=2
     X_train, X_test = X[:train_size], X[train_size:]
     y_train_reg, y_test_reg = y_regression[:train_size], y_regression[train_size:]
     y_train_class, y_test_class = y_classification[:train_size], y_classification[train_size:]
-
-    # --- Debugging Prints ---
-    print("\n--- Debugging Test Set Class Distribution ---")
-    print("Distribution of y_test_class:", pd.Series(y_test_class).value_counts())
-    print("Sample y_test_class:", y_test_class[:10])
 
 
     # --- 4. Build LSTM Regression Model ---
@@ -209,13 +208,14 @@ def train_lstm_model(symbol, start_date, end_date, seq_length=60, short_window=2
 
 
     print(f"Training Regression Model for {symbol}...")
-    history_reg = model_reg.fit(X_train, y_train_reg, epochs=epochs, batch_size=batch_size, validation_split=0.1, callbacks=[early_stopping, checkpoint_reg], verbose=1)
+    history_reg = model_reg.fit(X_train, y_train_reg, epochs=epochs, batch_size=batch_size, validation_split=0.1, callbacks=[early_stopping, checkpoint_reg], verbose=0) # Reduced verbosity
 
 
     # --- 6. Evaluate Models ---
     print(f"\n--- Evaluation for {symbol} ---")
     # Regression Evaluation
-    y_pred_reg = model_reg.predict(X_test)
+    model_reg.load_weights(os.path.join(model_dir, f"lstm.h5")) # Load best weights
+    y_pred_reg = model_reg.predict(X_test, verbose=0) # Reduced verbosity during prediction
     # Inverse transform to get original scale
     y_pred_reg_orig = scaler.inverse_transform(np.hstack([y_pred_reg, np.zeros((y_pred_reg.shape[0], scaled_data.shape[1]-1))]))[:, 0]
     y_test_reg_orig = scaler.inverse_transform(np.hstack([y_test_reg.reshape(-1,1), np.zeros((y_test_reg.shape[0], scaled_data.shape[1]-1))]))[:, 0]
@@ -223,16 +223,8 @@ def train_lstm_model(symbol, start_date, end_date, seq_length=60, short_window=2
 
     # Classification Evaluation from Regression Model
     # Get lagged prices for the test set corresponding to the regression predictions
-    y_lagged_test = data_filtered[f'Lagged_Return_{lag_days}'].values[train_size + seq_length:] # Adjusted index to align with test set and sequence length
+    y_lagged_test = data_filtered[f'Lagged_Return_{lag_days}'].values[train_size + seq_length:]  # Adjusted index to align with test set and sequence length
     y_pred_class_from_reg = create_classification_labels(y_pred_reg_orig, y_lagged_test)
-
-    # --- Debugging Prints for Predictions and Labels ---
-    print("\n--- Debugging Prediction and Label Distributions ---")
-    print("Distribution of y_pred_class_from_reg:", pd.Series(y_pred_class_from_reg).value_counts())
-    print("Sample y_pred_class_from_reg:", y_pred_class_from_reg[:10])
-    print("Sample y_test_class:", y_test_class[:10])
-    print("Sample y_pred_reg_orig:", y_pred_reg_orig[:10])
-    print("Sample y_lagged_test:", y_lagged_test[:10])
 
 
     accuracy, conf_matrix, class_report, sensitivity, specificity, precision, f1 = evaluate_classification(y_test_class, y_pred_class_from_reg) # Evaluate classification metrics
@@ -249,9 +241,107 @@ def train_lstm_model(symbol, start_date, end_date, seq_length=60, short_window=2
     # --- 7. Save Regression Model (already handled by ModelCheckpoint callback) ---
     print(f"\nRegression model saved to: {os.path.join(model_dir, f'lstm.h5')}") # Inform user about save path
 
+    # --- 8. Store Evaluation Results in MongoDB ---
+    evaluation_metrics = {
+        "stock_symbol": symbol,
+        "start_date": start_date, # Keep as string for simplicity
+        "end_date": end_date,     # Keep as string for simplicity
+        "seq_length": seq_length,
+        "short_window": short_window,
+        "long_window": long_window,
+        "lag_days": lag_days,
+        "lstm_units": lstm_units,
+        "dropout_rate": dropout_rate,
+        "epochs": epochs,
+        "batch_size": batch_size,
+        "patience": patience,
+        "regression_mse": mse,
+        "regression_rmse": rmse,
+        "regression_mae": mae,
+        "regression_mape": mape,
+        "regression_r2": r2,
+        "classification_accuracy": accuracy,
+        "classification_sensitivity": sensitivity,
+        "classification_specificity": specificity,
+        "classification_precision": precision,
+        "classification_f1_score": f1,
+        "classification_confusion_matrix": conf_matrix.tolist(), # Store confusion matrix as list
+        "classification_report": class_report # Store classification report as string
+    }
+
+    try:
+        evaluation_results_collection.insert_one(evaluation_metrics)
+        print(f"\nEvaluation results for {symbol} stored in MongoDB.")
+    except Exception as e:
+        print(f"Error storing evaluation results in MongoDB: {e}")
+
+    return evaluation_metrics # Return the metrics for potential further use
+
+
 
 if __name__ == '__main__':
-    symbol = "AAPL"
-    start_date = "2020-02-25"
-    end_date = "2025-02-25"
-    train_lstm_model(symbol, start_date, end_date, epochs=75, lstm_units = 60, patience=15) # example of more specific training
+    # --- MongoDB Connection Details ---
+    mongo_uri = "mongodb://localhost:27017/"  # Replace with your MongoDB URI if needed
+    db_name = "stock_market_db" # Database name to store evaluation results
+    evaluation_collection_name = "lstm_evaluation_results" # Collection name for LSTM results
+
+    # --- Date Range for Training and Prediction ---
+    start_date_str = "2020-02-25" # Original start date
+    end_date_str = "2023-02-25"  # Modified end date for less compute
+
+    start_date = datetime.datetime.strptime(start_date_str, "%Y-%m-%d").strftime("%Y-%m-%d") # Keep as string for yfinance
+    end_date = datetime.datetime.strptime(end_date_str, "%Y-%m-%d").strftime("%Y-%m-%d")   # Keep as string for yfinance
+
+
+    # --- LSTM Model Parameters (Example - you can experiment with these) ---
+    lstm_units = 60
+    dropout_rate = 0.2
+    epochs = 75
+    batch_size = 32
+    patience = 15
+    seq_length = 60
+    short_window = 20
+    long_window = 50
+    lag_days = 1
+
+
+    # --- Load Stock Symbols from CSV ---
+    stocks_file = "stocks.csv" # Ensure stocks.csv is in the same directory
+    try:
+        stocks_df = pd.read_csv(stocks_file)
+        stock_symbols = stocks_df['Symbol'].tolist()
+    except FileNotFoundError:
+        print(f"Error: {stocks_file} not found. Please make sure it exists in the same directory.")
+        exit()
+    except KeyError:
+        print(f"Error: 'Symbol' column not found in {stocks_file}. Please check the CSV file format.")
+        exit()
+
+
+    client = None # Initialize client outside the loop
+    try:
+        client = MongoClient(mongo_uri)
+        db = client[db_name]
+        evaluation_results_collection = db[evaluation_collection_name]
+
+        for symbol in stock_symbols:
+            print(f"\n--- Processing Stock: {symbol} ---")
+            try:
+                evaluation_metrics = train_lstm_model(symbol, start_date, end_date, evaluation_results_collection, seq_length, short_window, long_window, lag_days, lstm_units, dropout_rate, epochs, batch_size, patience)
+                if evaluation_metrics is None: # Handle case where model training/evaluation failed for a stock
+                    print(f"Skipping to next stock due to errors processing {symbol}.")
+                    continue # Skip to the next stock symbol
+            except Exception as e:
+                print(f"An error occurred while processing {symbol}: {e}")
+
+
+    except pymongo.errors.ConnectionFailure as e:
+        print(f"Could not connect to MongoDB: {e}")
+    except Exception as e:
+        print(f"An unexpected error occurred in main program: {e}")
+    finally:
+        if client:
+            client.close()
+
+
+    print("\n--- LSTM Stock Price Prediction and Evaluation Completed for all symbols. ---")

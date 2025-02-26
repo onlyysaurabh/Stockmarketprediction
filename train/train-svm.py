@@ -9,6 +9,7 @@ from pymongo import MongoClient
 import pickle
 import os
 import numpy as np
+from datetime import datetime
 
 # --- 1. Load Stock Price Data from MongoDB ---
 def load_data_from_mongodb(mongo_uri, db_name, collection_name, stock_symbol, start_date=None, end_date=None):
@@ -84,8 +85,8 @@ def train_svm_model(X_train, y_train, kernel='rbf', C=1.0, epsilon=0.1):
     return model
 
 # --- 4. Evaluate Model ---
-def evaluate_model(model, X_test, y_test, close_scaler):
-    """Evaluates the trained SVM model."""
+def evaluate_model(model, X_test, y_test, close_scaler, stock_symbol, start_date, end_date, evaluation_results_collection):
+    """Evaluates the trained SVM model and stores results in MongoDB."""
     y_pred = model.predict(X_test)
 
     # Inverse transform to get original scale - using close_scaler
@@ -126,6 +127,9 @@ def evaluate_model(model, X_test, y_test, close_scaler):
         print("  Confusion Matrix:\n", conf_matrix)
         print("  Classification Report:\n", class_report)
     else:
+        accuracy = 0
+        conf_matrix = np.array([])
+        class_report = "Not enough data for classification metrics."
         print("\nNot enough data to compute classification metrics (requires more than one data point).")
 
 
@@ -133,11 +137,34 @@ def evaluate_model(model, X_test, y_test, close_scaler):
     plt.figure(figsize=(12, 6))
     plt.plot(y_test_orig, label='Actual Prices', color='blue')
     plt.plot(y_pred_orig, label='Predicted Prices', color='red')
-    plt.title('SVM Model - Actual vs Predicted Stock Prices')
+    plt.title(f'SVM Model for {stock_symbol} - Actual vs Predicted Stock Prices') # Include stock symbol in title
     plt.xlabel('Time')
     plt.ylabel('Stock Price')
     plt.legend()
     plt.show()
+
+    # --- Store Evaluation Results in MongoDB ---
+    evaluation_data = {
+        "stock_symbol": stock_symbol,
+        "start_date": start_date.isoformat(),
+        "end_date": end_date.isoformat(),
+        "svr_kernel": model.kernel,
+        "svr_c": model.C,
+        "svr_epsilon": model.epsilon,
+        "regression_mse": mse,
+        "regression_rmse": rmse,
+        "regression_mae": mae,
+        "regression_mape": mape,
+        "regression_r2": r2,
+        "classification_accuracy": accuracy,
+        "classification_confusion_matrix": conf_matrix.tolist() if conf_matrix.size > 0 else [], # Store confusion matrix as list
+        "classification_report": class_report # Store classification report as string
+    }
+    try:
+        evaluation_results_collection.insert_one(evaluation_data)
+        print(f"\nEvaluation results for {stock_symbol} stored in MongoDB.")
+    except Exception as e:
+        print(f"Error storing evaluation results in MongoDB: {e}")
 
     return mse, rmse, mae, r2, mape, accuracy, conf_matrix, class_report
 
@@ -170,37 +197,70 @@ if __name__ == "__main__":
     mongo_uri = "mongodb://localhost:27017/"
     db_name = "stock_market_db"
     collection_name = "stock_data"
-
-    stock_symbol_to_predict = "AAPL"
+    evaluation_collection_name = "svm_evaluation_results" # Collection for SVM results
 
     # --- Date Range for Training and Prediction ---
-    start_date_str = "2023-01-01"
-    end_date_str = "2024-01-01"
-    start_date = pd.to_datetime(start_date_str)
-    end_date = pd.to_datetime(end_date_str)
+    start_date_str = "2023-01-01" # Original start date
+    end_date_str = "2023-07-01"  # Modified end date to reduce data
 
+    start_date = datetime.strptime(start_date_str, "%Y-%m-%d").date()
+    end_date = datetime.strptime(end_date_str, "%Y-%m-%d").date()
+
+
+    # --- Load Stock Symbols from CSV ---
+    stocks_file = "stocks.csv" # Ensure stocks.csv is in the same directory
     try:
-        # 1. Load Data from MongoDB with Date Range
-        df = load_data_from_mongodb(mongo_uri, db_name, collection_name, stock_symbol_to_predict, start_date, end_date)
+        stocks_df = pd.read_csv(stocks_file)
+        stock_symbols = stocks_df['Symbol'].tolist()
+    except FileNotFoundError:
+        print(f"Error: {stocks_file} not found. Please make sure it exists in the same directory.")
+        exit()
+    except KeyError:
+        print(f"Error: 'Symbol' column not found in {stocks_file}. Please check the CSV file format.")
+        exit()
 
-        # 2. Prepare Data for SVM
-        X_scaled, y, close_scaler = prepare_data_for_svm(df, look_back=60)
 
-        # 3. Split Data
-        X_train, X_test, y_train, y_test = train_test_split(X_scaled, y, test_size=0.2, shuffle=False)
+    client = None # Initialize client outside the loop
+    try:
+        client = MongoClient(mongo_uri)
+        db = client[db_name]
+        evaluation_results_collection = db[evaluation_collection_name]
 
-        # 4. Train SVM Model
-        svm_model = train_svm_model(X_train, y_train)
+        for stock_symbol_to_predict in stock_symbols:
+            print(f"\n--- Processing Stock: {stock_symbol_to_predict} ---")
+            try:
+                # 1. Load Data from MongoDB with Date Range
+                df = load_data_from_mongodb(mongo_uri, db_name, collection_name, stock_symbol_to_predict, start_date, end_date)
 
-        # 5. Evaluate Model
-        evaluate_model(svm_model, X_test, y_test, close_scaler)
+                # 2. Prepare Data for SVM
+                X_scaled, y, close_scaler = prepare_data_for_svm(df, look_back=60)
 
-        # 6. Save Trained Model and Scaler
-        save_model(svm_model, stock_symbol_to_predict, close_scaler)
+                # 3. Split Data
+                X_train, X_test, y_train, y_test = train_test_split(X_scaled, y, test_size=0.2, shuffle=False)
 
-    except FileNotFoundError as e:
-        print(f"File Error: {e}")
-    except ValueError as e:
-        print(f"Value Error: {e}")
+                # 4. Train SVM Model
+                svm_model = train_svm_model(X_train, y_train)
+
+                # 5. Evaluate Model and Store Results
+                evaluate_model(svm_model, X_test, y_test, close_scaler, stock_symbol_to_predict, start_date, end_date, evaluation_results_collection)
+
+                # 6. Save Trained Model and Scaler
+                save_model(svm_model, stock_symbol_to_predict, close_scaler)
+
+            except ValueError as ve:
+                print(f"Value Error for {stock_symbol_to_predict}: {ve}. Skipping stock.")
+                continue # Skip to the next stock symbol
+            except Exception as e:
+                print(f"An error occurred for {stock_symbol_to_predict}: {e}. Skipping stock.")
+                continue # Skip to the next stock symbol
+
+
+    except pymongo.errors.ConnectionFailure as e:
+        print(f"Could not connect to MongoDB: {e}")
     except Exception as e:
-        print(f"An error occurred: {e}")
+        print(f"An unexpected error occurred in main program: {e}")
+    finally:
+        if client:
+            client.close()
+
+    print("\n--- SVM Stock Price Prediction and Evaluation Completed for all symbols. ---")
