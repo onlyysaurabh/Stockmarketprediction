@@ -15,9 +15,44 @@ import os
 from tqdm import tqdm  # Import tqdm for progress bar
 from datetime import datetime, timezone
 
+# --- Feature Engineering Functions ---
+def calculate_moving_average(series, window=10):
+    """Calculates the simple moving average."""
+    return series.rolling(window=window).mean()
+
+def calculate_rsi(series, period=14):
+    """Calculates the Relative Strength Index."""
+    delta = series.diff().dropna()
+    up, down = delta.copy(), delta.copy()
+    up[up < 0] = 0
+    down[down > 0] = 0
+    roll_up1 = up.ewm(span=period).mean()
+    roll_down1 = np.abs(down.ewm(span=period).mean())
+    RS = roll_up1 / roll_down1
+    RSI = 100.0 - (100.0 / (1.0 + RS))
+    return RSI
+
+def calculate_macd(series, fast_period=12, slow_period=26, signal_period=9):
+    """Calculates Moving Average Convergence Divergence."""
+    ema_fast = series.ewm(span=fast_period).mean()
+    ema_slow = series.ewm(span=slow_period).mean()
+    macd_line = ema_fast - ema_slow
+    signal_line = macd_line.ewm(span=signal_period).mean()
+    macd_histogram = macd_line - signal_line
+    return macd_line, signal_line, macd_histogram
+
+def calculate_atr(df, period=14):
+    """Calculates Average True Range."""
+    high_low = df['High'] - df['Low']
+    high_close_prev = np.abs(df['High'] - df['Close'].shift(1))
+    low_close_prev = np.abs(df['Low'] - df['Close'].shift(1))
+    tr = pd.concat([high_low, high_close_prev, low_close_prev], axis=1).max(axis=1)
+    atr = tr.rolling(window=period).mean()
+    return atr
+
 # --- 1. Load Stock Price Data from MongoDB ---
-def load_data_from_mongodb(mongo_uri, db_name, collection_name, stock_symbol, price_field='Close', start_date=None, end_date=None):
-    """Loads stock price data from MongoDB, with optional date range."""
+def load_data_from_mongodb(mongo_uri, db_name, collection_name, stock_symbol, price_field='Close', start_date=None, end_date=None, feature_engineering=True):
+    """Loads stock price data from MongoDB, with optional date range and feature engineering."""
     client = None  # Initialize client outside the try block
     try:
         client = MongoClient(mongo_uri)
@@ -31,7 +66,7 @@ def load_data_from_mongodb(mongo_uri, db_name, collection_name, stock_symbol, pr
             end_datetime = datetime.combine(end_date, datetime.max.time()).replace(tzinfo=timezone.utc)
             query["Date"] = {"$gte": start_datetime, "$lte": end_datetime} # Add date range to query
 
-        projection = {"Date": 1, price_field: 1, "_id": 0}
+        projection = {"Date": 1, "Open": 1, "High": 1, "Low": 1, "Close": 1, "Volume": 1, "_id": 0} # Include OHLCV for feature engineering
         sort = [("Date", pymongo.ASCENDING)]
 
         cursor = collection.find(query, projection=projection).sort(sort)
@@ -48,9 +83,21 @@ def load_data_from_mongodb(mongo_uri, db_name, collection_name, stock_symbol, pr
         df['Date'] = pd.to_datetime(df['Date'])
         df.set_index('Date', inplace=True)
 
-        price_series = df[price_field].squeeze()
+        if feature_engineering:
+            df['MA_10'] = calculate_moving_average(df['Close'], window=10)
+            df['RSI'] = calculate_rsi(df['Close'])
+            macd_line, signal_line, macd_histogram = calculate_macd(df['Close'])
+            df['MACD_Line'] = macd_line
+            df['MACD_Signal'] = signal_line
+            df['ATR'] = calculate_atr(df)
+            df['Price_Range'] = df['High'] - df['Low']
+            df['Volume_Change'] = df['Volume'].diff()
 
-        return price_series
+            df.dropna(inplace=True) # Important: Drop rows with NaN after feature engineering
+
+        price_series = df[price_field].squeeze() # Still predicting 'Close' price
+
+        return price_series, df # Return both price_series and the feature-rich DataFrame
 
     except pymongo.errors.ConnectionFailure as e:
         raise Exception(f"Could not connect to MongoDB: {e}")
@@ -87,18 +134,45 @@ def make_stationary(series, d=1):
 # --- 4. Split Data into Training and Testing Sets ---
 def train_test_split(data, test_size=0.2):
     """Splits time series data into training and testing sets."""
-    if not isinstance(data, pd.Series):
-        raise ValueError("Input data must be a pandas Series.")
-    split_index = int(len(data) * (1 - test_size))
-    train_data, test_data = data[:split_index], data[split_index:]
+    if not isinstance(data, pd.Series): # Modified to accept Series or DataFrame
+        if not isinstance(data, pd.DataFrame):
+            raise ValueError("Input data must be a pandas Series or DataFrame.")
+
+    if isinstance(data, pd.Series):
+        split_index = int(len(data) * (1 - test_size))
+        train_data, test_data = data[:split_index], data[split_index:]
+    elif isinstance(data, pd.DataFrame):
+        split_index = int(len(data) * (1 - test_size))
+        train_data, test_data = data[:split_index], data[split_index:]
     return train_data, test_data
 
-# --- 5. Manually Define ARIMA (p, d, q) parameters (pmdarima is removed) ---
-def get_manual_arima_params():
-    """Manually defines ARIMA parameters (p, d, q)."""
-    manual_order = (1, 1, 1)
-    print(f"Using manual ARIMA order: ARIMA{manual_order}")
-    return manual_order
+# --- 5. Automatically Select ARIMA (p, d, q) parameters using AIC ---
+def get_auto_arima_params(train_series, max_p=3, max_q=3):
+    """Automatically defines ARIMA parameters (p, d, q) using AIC minimization."""
+    best_aic = float("inf")
+    best_order = None
+    best_model_fit = None
+
+    for p in range(max_p + 1):
+        for q in range(max_q + 1):
+            order = (p, 0, q) # d is already determined by stationarity check
+            try:
+                model = ARIMA(train_series, order=order)
+                model_fit = model.fit()
+                aic = model_fit.aic
+                if aic < best_aic:
+                    best_aic = aic
+                    best_order = order
+                    best_model_fit = model_fit
+            except Exception as e: # Catch any potential errors during model fitting
+                continue # Just continue to the next combination if there's an issue
+
+    if best_order:
+        print(f"Automated ARIMA parameter selection - Best Order: ARIMA{best_order} with AIC={best_aic:.2f}")
+        return best_order
+    else:
+        print("Automated ARIMA parameter selection failed to find a suitable order. Using default (1,1,1).")
+        return (1, 1, 1) # Return default order if auto selection fails
 
 # --- 6. Train ARIMA Model ---
 def train_arima_model(train_series, order):
@@ -115,10 +189,7 @@ def train_arima_model(train_series, order):
 
 # --- 7. Evaluate Model on Test Set (Walk-Forward Validation) ---
 def evaluate_model(model_fit, train_series, test_series, original_series, diff_order, stock_symbol, order):
-    """Evaluates the trained ARIMA model using walk-forward validation and displays
-        evaluation metrics including confusion matrix, accuracy, precision, recall,
-        sensitivity, specificity, and F1-score. Stores the trained model.
-    """
+    """Evaluates the trained ARIMA model using walk-forward validation."""
     history = list(train_series)
     predictions = []
     for t in tqdm(range(len(test_series)), desc="Walk-Forward Validation"): # Added tqdm progress bar
@@ -218,28 +289,31 @@ if __name__ == "__main__":
     price_field_to_use = 'Close'
 
     # --- Date Range for Training and Prediction ---
-    start_date_str = "2020-02-25"  # Example start date for data loading
-    end_date_str = "2025-02-25"    # Example end date for data loading
+    start_date_str = "2020-02-25"  # Original start date
+    end_date_str = "2025-02-25"   # Original end date
+
     start_date = datetime.strptime(start_date_str, "%Y-%m-%d").date()
     end_date = datetime.strptime(end_date_str, "%Y-%m-%d").date()
 
 
     try:
-        # 1. Load Data from MongoDB with Date Range
-        stock_series = load_data_from_mongodb(mongo_uri, db_name, collection_name, stock_symbol_to_predict, price_field_to_use, start_date, end_date)
+        # 1. Load Data from MongoDB with Date Range and Feature Engineering
+        stock_series, feature_df = load_data_from_mongodb(mongo_uri, db_name, collection_name, stock_symbol_to_predict, price_field_to_use, start_date, end_date, feature_engineering=True)
 
-        # 2. Handle Stationarity
+        # 2. Handle Stationarity (using 'Close' price series)
         stationary_series, diff_order = make_stationary(stock_series.copy())
         if stationary_series is None:
             print("Failed to make series stationary. Exiting.")
             exit()
 
-        # 3. Split Data
+        # 3. Split Data (split the feature DataFrame as well to keep features aligned with target 'Close' price)
         train_data, test_data = train_test_split(stationary_series)
         original_train, original_test = train_test_split(stock_series) # Keep original_train, original_test although not directly used.
 
-        # 4. Manually Set ARIMA Parameters (No pmdarima)
-        best_order = get_manual_arima_params()
+        feature_train_df, feature_test_df = train_test_split(feature_df) # Split the feature-rich DataFrame
+
+        # 4. Automatically Set ARIMA Parameters (using AIC for stationary series)
+        best_order = get_auto_arima_params(train_data, max_p=3, max_q=3) # You can adjust max_p and max_q
 
         # 5. Train ARIMA Model
         arima_model_fit = train_arima_model(train_data, best_order)

@@ -1,332 +1,257 @@
-# modify the code to add date range to control how much data is used for training and prediction to make it less compute heavy
-import numpy as np
+import yfinance as yf
 import pandas as pd
-import matplotlib.pyplot as plt
-import statsmodels.api as sm
-from statsmodels.tsa.arima.model import ARIMA
-from sklearn.metrics import mean_squared_error, mean_absolute_error, accuracy_score
-from statsmodels.tsa.stattools import adfuller
-import warnings
-warnings.filterwarnings("ignore")
-import pymongo
-from pymongo import MongoClient
-import pickle
+import numpy as np
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.model_selection import train_test_split
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import LSTM, Dense, Dropout
+from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score, accuracy_score, confusion_matrix, classification_report, recall_score
 import os
-from tqdm import tqdm  # Import tqdm for progress bar
-from datetime import datetime, timezone
+import datetime
 
-# --- Feature Engineering Functions ---
-def calculate_moving_average(series, window=10):
-    """Calculates the simple moving average."""
-    return series.rolling(window=window).mean()
+def calculate_technical_indicators(df, short_window=20, long_window=50, lag_days=1):
+    """
+    Calculates technical indicators: Moving Averages, and Lagged Returns.
 
-def calculate_rsi(series, period=14):
-    """Calculates the Relative Strength Index."""
-    delta = series.diff().dropna()
-    up, down = delta.copy(), delta.copy()
-    up[up < 0] = 0
-    down[down > 0] = 0
-    roll_up1 = up.ewm(span=period).mean()
-    roll_down1 = np.abs(down.ewm(span=period).mean())
-    RS = roll_up1 / roll_down1
-    RSI = 100.0 - (100.0 / (1.0 + RS))
-    return RSI
+    Args:
+        df: DataFrame with 'Close' prices.
+        short_window: Window size for the short moving average.
+        long_window: Window size for the long moving average.
+        lag_days: Number of days to lag returns.
 
-def calculate_macd(series, fast_period=12, slow_period=26, signal_period=9):
-    """Calculates Moving Average Convergence Divergence."""
-    ema_fast = series.ewm(span=fast_period).mean()
-    ema_slow = series.ewm(span=slow_period).mean()
-    macd_line = ema_fast - ema_slow
-    signal_line = macd_line.ewm(span=signal_period).mean()
-    macd_histogram = macd_line - signal_line
-    return macd_line, signal_line, macd_histogram
+    Returns:
+        DataFrame with added indicator columns. Returns an empty DataFrame on error.
+    """
+    if 'Close' not in df.columns:
+        print("Error: 'Close' column not found in DataFrame.")
+        return pd.DataFrame()
 
-def calculate_atr(df, period=14):
-    """Calculates Average True Range."""
-    high_low = df['High'] - df['Low']
-    high_close_prev = np.abs(df['High'] - df['Close'].shift(1))
-    low_close_prev = np.abs(df['Low'] - df['Close'].shift(1))
-    tr = pd.concat([high_low, high_close_prev, low_close_prev], axis=1).max(axis=1)
-    atr = tr.rolling(window=period).mean()
-    return atr
+    df = df.copy()  # Work on a copy to avoid modifying the original
 
-# --- 1. Load Stock Price Data from MongoDB ---
-def load_data_from_mongodb(mongo_uri, db_name, collection_name, stock_symbol, price_field='Close', start_date=None, end_date=None, feature_engineering=True):
-    """Loads stock price data from MongoDB, with optional date range and feature engineering."""
-    client = None  # Initialize client outside the try block
+    # Simple Moving Averages
+    df['SMA_Short'] = df['Close'].rolling(window=short_window).mean()
+    df['SMA_Long'] = df['Close'].rolling(window=long_window).mean()
+
+    # Exponential Moving Averages (EMA)
+    df['EMA_Short'] = df['Close'].ewm(span=short_window, adjust=False).mean()
+    df['EMA_Long'] = df['Close'].ewm(span=long_window, adjust=False).mean()
+
+    # Lagged Returns (for creating target variable and features)
+    df[f'Lagged_Return_{lag_days}'] = df['Close'].shift(lag_days)
+
+    # Drop rows with NaN values introduced by indicators
+    df.dropna(inplace=True)
+    return df
+
+
+
+def create_sequences(data, seq_length):
+    """
+    Creates sequences for LSTM input.
+
+    Args:
+        data: NumPy array of features.
+        seq_length: Length of the input sequences.
+
+    Returns:
+        X: Input sequences.
+        y: Corresponding target values (next day's close).
+    """
+    X = []
+    y = []
+    for i in range(len(data) - seq_length):
+        X.append(data[i:(i + seq_length), :])
+        y.append(data[i + seq_length, 0])  # Assuming 'Close' is the first column after scaling
+    return np.array(X), np.array(y)
+
+
+def create_classification_labels(y_regression, y_lagged):
+    """
+    Creates classification labels (Up/Down) based on regression targets.
+    """
+    return np.where(y_regression > y_lagged, 1, 0)  # 1 for Up, 0 for Down
+
+
+def evaluate_regression(y_true, y_pred):
+    """Evaluates regression performance and calculates MAPE."""
+    mse = mean_squared_error(y_true, y_pred)
+    rmse = np.sqrt(mse)
+    mae = mean_absolute_error(y_true, y_pred)
+    r2 = r2_score(y_true, y_pred)
+    # Calculate MAPE, handling potential division by zero
+    mape_numerator = np.abs(y_true - y_pred)
+    mape_denominator = np.abs(y_true)
+    # Avoid division by zero for zero values in y_true, replace with small value or filter out
+    mape_denominator = np.where(mape_denominator == 0, np.finfo(float).eps, mape_denominator) # Replace 0 with epsilon
+    mape = np.mean(mape_numerator / mape_denominator) * 100
+
+    print("\nRegression Metrics:")
+    print(f"  Mean Squared Error (MSE): {mse:.4f}")
+    print(f"  Root Mean Squared Error (RMSE): {rmse:.4f}")
+    print(f"  Mean Absolute Error (MAE): {mae:.4f}")
+    print(f"  MAPE: {mape:.2f}%") # Added MAPE
+    print(f"  R-squared (R2): {r2:.4f}")
+    return mse, rmse, mae, r2, mape # Return MAPE
+
+
+def evaluate_classification(y_true, y_pred):
+    """Evaluates classification performance and calculates additional metrics."""
+    accuracy = accuracy_score(y_true, y_pred)
+    conf_matrix = confusion_matrix(y_true, y_pred)
+    class_report = classification_report(y_true, y_pred, zero_division=0) # added zero_division=0 to handle cases with no predicted samples for a class
+
+    if conf_matrix.size == 4: # Standard 2x2 confusion matrix
+        tn, fp, fn, tp = conf_matrix.ravel()
+
+        sensitivity = tp / (tp + fn) if (tp + fn) > 0 else 0
+        specificity = tn / (tn + fp) if (tn + fp) > 0 else 0
+        precision = tp / (tp + fp) if (tp + fp) > 0 else 0
+        f1 = 2 * (precision * recall_score(y_true, y_pred, zero_division=0)) / (precision + recall_score(y_true, y_pred, zero_division=0)) if (precision + recall_score(y_true, y_pred, zero_division=0)) > 0 else 0
+    else: # Handle cases with less than 2 classes in predictions
+        print("Warning: Confusion matrix is not 2x2, possibly due to single class in y_true or y_pred.")
+        tn, fp, fn, tp = 0, 0, 0, 0 # Set metrics to zero or handle as needed
+        sensitivity, specificity, precision, f1 = 0, 0, 0, 0
+
+
+    print("\nClassification Metrics:")
+    print(f"  Accuracy: {accuracy:.4f}")
+    print("  Confusion Matrix:\n", conf_matrix)
+    print(f"  Sensitivity (Recall or True Positive Rate): {sensitivity:.2f}") # Added Sensitivity
+    print(f"  Specificity (True Negative Rate): {specificity:.2f}")     # Added Specificity
+    print(f"  Precision: {precision:.2f}")                                   # Added Precision
+    print(f"  F1-Score: {f1:.2f}")                                            # Added F1-Score
+    print("  Classification Report:\n", class_report)
+    return accuracy, conf_matrix, class_report, sensitivity, specificity, precision, f1 # Return additional metrics
+
+
+def train_lstm_model(symbol, start_date, end_date, seq_length=60, short_window=20, long_window=50, lag_days=1, lstm_units=50, dropout_rate=0.2, epochs=50, batch_size=32, patience=10):
+    """
+    Trains and evaluates LSTM models for regression and classification.
+
+    Args:
+        symbol: Stock symbol (e.g., "AAPL").
+        start_date: Start date for data fetching (YYYY-MM-DD).
+        end_date: End date for data fetching (YYYY-MM-DD).
+        seq_length: Sequence length for LSTM input.
+        short_window:  Short moving average window.
+        long_window: Long moving average window.
+        lag_days: Number of days to lag returns.
+        lstm_units: Number of LSTM units.
+        dropout_rate: Dropout rate.
+        epochs: Number of training epochs.
+        batch_size: Batch size.
+        patience:  Patience for EarlyStopping
+
+    Returns:
+        None (saves models and prints evaluation results)
+    """
+
+    # --- 1. Data Fetching and Preprocessing ---
     try:
-        client = MongoClient(mongo_uri)
-        db = client[db_name]
-        collection = db[collection_name]
-
-        query = {"Symbol": stock_symbol}
-        if start_date and end_date:
-            # Convert datetime.date to datetime.datetime with UTC timezone for MongoDB compatibility
-            start_datetime = datetime.combine(start_date, datetime.min.time()).replace(tzinfo=timezone.utc)
-            end_datetime = datetime.combine(end_date, datetime.max.time()).replace(tzinfo=timezone.utc)
-            query["Date"] = {"$gte": start_datetime, "$lte": end_datetime} # Add date range to query
-
-        projection = {"Date": 1, "Open": 1, "High": 1, "Low": 1, "Close": 1, "Volume": 1, "_id": 0} # Include OHLCV for feature engineering
-        sort = [("Date", pymongo.ASCENDING)]
-
-        cursor = collection.find(query, projection=projection).sort(sort)
-        data_list = list(cursor)
-
-        if not data_list:
-            raise ValueError(f"No data found for symbol '{stock_symbol}' in MongoDB collection '{collection_name}' within the specified date range.")
-
-        df = pd.DataFrame(data_list)
-
-        if 'Date' not in df.columns or price_field not in df.columns:
-            raise ValueError(f"Required fields 'Date' and '{price_field}' not found in MongoDB data.")
-
-        df['Date'] = pd.to_datetime(df['Date'])
-        df.set_index('Date', inplace=True)
-
-        if feature_engineering:
-            df['MA_10'] = calculate_moving_average(df['Close'], window=10)
-            df['RSI'] = calculate_rsi(df['Close'])
-            macd_line, signal_line, macd_histogram = calculate_macd(df['Close'])
-            df['MACD_Line'] = macd_line
-            df['MACD_Signal'] = signal_line
-            df['ATR'] = calculate_atr(df)
-            df['Price_Range'] = df['High'] - df['Low']
-            df['Volume_Change'] = df['Volume'].diff()
-
-            df.dropna(inplace=True) # Important: Drop rows with NaN after feature engineering
-
-        price_series = df[price_field].squeeze() # Still predicting 'Close' price
-
-        return price_series, df # Return both price_series and the feature-rich DataFrame
-
-    except pymongo.errors.ConnectionFailure as e:
-        raise Exception(f"Could not connect to MongoDB: {e}")
+        data = yf.download(symbol, start=start_date, end=end_date)
+        if data.empty:
+            print(f"No data found for {symbol} between {start_date} and {end_date}.")
+            return
     except Exception as e:
-        raise Exception(f"Error loading data from MongoDB: {e}")
-    finally:
-        if client: # Check if client is defined before trying to close
-            client.close()
+        print(f"Error downloading data for {symbol}: {e}")
+        return
 
-# --- 2. Check for Stationarity using ADF Test ---
-def check_stationarity(series):
-    """Performs Augmented Dickey-Fuller test to check for stationarity."""
-    dftest = adfuller(series, autolag='AIC')
-    dfoutput = pd.Series(dftest[0:4], index=['Test Statistic','p-value','#Lags Used','Number of Observations Used'])
-    for key,value in dftest[4].items():
-        dfoutput['Critical Value (%s)'%key] = value
-    if dfoutput['p-value'] <= 0.05:
-        return True
-    else:
-        return False
+    data = calculate_technical_indicators(data, short_window, long_window, lag_days)
+    if data.empty: # check if indicators were calculated correctly
+        return
 
-# --- 3. Make Series Stationary (if needed) using Differencing ---
-def make_stationary(series, d=1):
-    """Makes a time series stationary by differencing."""
-    if not check_stationarity(series):
-        diff_series = series.diff(d).dropna()
-        if check_stationarity(diff_series):
-            return diff_series, d
-        else:
-            return None, d
-    else:
-        return series, 0
-
-# --- 4. Split Data into Training and Testing Sets ---
-def train_test_split(data, test_size=0.2):
-    """Splits time series data into training and testing sets."""
-    if not isinstance(data, pd.Series): # Modified to accept Series or DataFrame
-        if not isinstance(data, pd.DataFrame):
-            raise ValueError("Input data must be a pandas Series or DataFrame.")
-
-    if isinstance(data, pd.Series):
-        split_index = int(len(data) * (1 - test_size))
-        train_data, test_data = data[:split_index], data[split_index:]
-    elif isinstance(data, pd.DataFrame):
-        split_index = int(len(data) * (1 - test_size))
-        train_data, test_data = data[:split_index], data[split_index:]
-    return train_data, test_data
-
-# --- 5. Automatically Select ARIMA (p, d, q) parameters using AIC ---
-def get_auto_arima_params(train_series, max_p=3, max_q=3):
-    """Automatically defines ARIMA parameters (p, d, q) using AIC minimization."""
-    best_aic = float("inf")
-    best_order = None
-    best_model_fit = None
-
-    for p in range(max_p + 1):
-        for q in range(max_q + 1):
-            order = (p, 0, q) # d is already determined by stationarity check
-            try:
-                model = ARIMA(train_series, order=order)
-                model_fit = model.fit()
-                aic = model_fit.aic
-                if aic < best_aic:
-                    best_aic = aic
-                    best_order = order
-                    best_model_fit = model_fit
-            except Exception as e: # Catch any potential errors during model fitting
-                continue # Just continue to the next combination if there's an issue
-
-    if best_order:
-        print(f"Automated ARIMA parameter selection - Best Order: ARIMA{best_order} with AIC={best_aic:.2f}")
-        return best_order
-    else:
-        print("Automated ARIMA parameter selection failed to find a suitable order. Using default (1,1,1).")
-        return (1, 1, 1) # Return default order if auto selection fails
-
-# --- 6. Train ARIMA Model ---
-def train_arima_model(train_series, order):
-    """Trains an ARIMA model on the training data."""
-    print("Starting ARIMA model training...")  # Progress message
-    try:
-        model = ARIMA(train_series, order=order)
-        model_fit = model.fit()
-        print("ARIMA model training finished.") # Progress message
-        return model_fit
-    except Exception as e:
-        print(f"Error training ARIMA model: {e}")
-        return None
-
-# --- 7. Evaluate Model on Test Set (Walk-Forward Validation) ---
-def evaluate_model(model_fit, train_series, test_series, original_series, diff_order, stock_symbol, order):
-    """Evaluates the trained ARIMA model using walk-forward validation."""
-    history = list(train_series)
-    predictions = []
-    for t in tqdm(range(len(test_series)), desc="Walk-Forward Validation"): # Added tqdm progress bar
-        model = ARIMA(history, order=order)
-        model_fit_wf = model.fit()
-        output = model_fit_wf.forecast()
-        yhat = output[0]
-        predictions.append(yhat)
-        history.append(test_series[t])
-
-    if diff_order > 0:
-        predictions_original_scale = []
-        history_original_scale = list(original_series[:len(train_series)])
-
-        for i in range(len(predictions)):
-            yhat_original_scale = predictions[i] + history_original_scale[-1]
-            predictions_original_scale.append(yhat_original_scale)
-            history_original_scale.append(original_series[len(train_series) + i])
-    else:
-        predictions_original_scale = predictions
-        history_original_scale = list(original_series)
-
-    # Correct the start index for actual values in original scale
-    start_index = len(train_series) + diff_order
-    actuals_original_scale = original_series[start_index:].values
-
-    # Ensure the lengths match the test series length
-    actuals_original_scale = actuals_original_scale[:len(test_series)]
-    predictions_original_scale = predictions_original_scale[:len(test_series)]
-
-    # Calculate regression metrics
-    rmse_val = np.sqrt(mean_squared_error(actuals_original_scale, predictions_original_scale))
-    mae_val = mean_absolute_error(actuals_original_scale, predictions_original_scale)
-    mape_val = np.mean(np.abs((actuals_original_scale - predictions_original_scale) / actuals_original_scale)) * 100
-
-    print(f'\nModel Evaluation (Original Scale - Regression Metrics):')
-    print(f'RMSE: {rmse_val:.2f}')
-    print(f'MAE: {mae_val:.2f}')
-    print(f'MAPE: {mape_val:.2f}%')
-
-    # Calculate classification metrics
-    actual_directions = np.diff(actuals_original_scale) > 0
-    predicted_directions = np.diff(predictions_original_scale) > 0
-
-    # Calculate confusion matrix and other metrics
-    from sklearn.metrics import confusion_matrix, precision_score, recall_score, f1_score
-    cm = confusion_matrix(actual_directions, predicted_directions)
-    tn, fp, fn, tp = cm.ravel()
-
-    sensitivity = tp / (tp + fn) if (tp + fn) > 0 else 0
-    specificity = tn / (tn + fp) if (tn + fp) > 0 else 0
-    precision = precision_score(actual_directions, predicted_directions)
-    recall = recall_score(actual_directions, predicted_directions)
-    f1 = f1_score(actual_directions, predicted_directions)
-
-    print(f'\nModel Evaluation (Direction Prediction - Classification Metrics):')
-    print("Confusion Matrix:")
-    print(cm)
-    print(f'Accuracy: {accuracy_score(actual_directions, predicted_directions):.2f}')
-    print(f'Sensitivity (Recall or True Positive Rate): {sensitivity:.2f}')
-    print(f'Specificity (True Negative Rate): {specificity:.2f}')
-    print(f'Precision: {precision:.2f}')
-    print(f'F1-Score: {f1:.2f}')
+    # Feature Selection and Scaling
+    features = ['Close', 'SMA_Short', 'SMA_Long', 'EMA_Short', 'EMA_Long', f'Lagged_Return_{lag_days}']  # Include indicators
+    data_filtered = data[features]
 
 
-    # Plotting Predictions vs Actual in Original Scale
-    plt.figure(figsize=(12, 6))
-    plt.plot(actuals_original_scale, label='Actual Prices', color='blue')
-    plt.plot(predictions_original_scale, label='Predicted Prices', color='red')
-    plt.title('ARIMA Model - Actual vs Predicted Stock Prices')
-    plt.xlabel('Time')
-    plt.ylabel('Stock Price')
-    plt.legend()
-    plt.show()
+    scaler = MinMaxScaler()
+    scaled_data = scaler.fit_transform(data_filtered)
 
-    # --- Store Trained Model ---
-    model_dir = f"models/{stock_symbol}"
+
+    # --- 2. Create Sequences and Labels ---
+    X, y_regression = create_sequences(scaled_data, seq_length)
+    y_classification = create_classification_labels(y_regression, data_filtered[f'Lagged_Return_{lag_days}'].values[seq_length:])
+
+    # --- 3. Train/Test Split ---
+    # Split based on time to preserve chronological order
+    train_size = int(len(X) * 0.8)
+    X_train, X_test = X[:train_size], X[train_size:]
+    y_train_reg, y_test_reg = y_regression[:train_size], y_regression[train_size:]
+    y_train_class, y_test_class = y_classification[:train_size], y_classification[train_size:]
+
+    # --- Debugging Prints ---
+    print("\n--- Debugging Test Set Class Distribution ---")
+    print("Distribution of y_test_class:", pd.Series(y_test_class).value_counts())
+    print("Sample y_test_class:", y_test_class[:10])
+
+
+    # --- 4. Build LSTM Regression Model ---
+
+    # Regression Model
+    model_reg = Sequential([
+        LSTM(lstm_units, activation='relu', return_sequences=True, input_shape=(X_train.shape[1], X_train.shape[2])),
+        Dropout(dropout_rate),
+        LSTM(lstm_units, activation='relu'),
+        Dropout(dropout_rate),
+        Dense(1)  # Output layer for regression
+    ])
+    model_reg.compile(optimizer='adam', loss='mse')
+
+    # --- 5. Train Regression Model with Callbacks ---
+    model_dir = f"./models/{symbol}" # Modified model directory to store in /models/{symbol}
     os.makedirs(model_dir, exist_ok=True)
-    model_path = os.path.join(model_dir, "arima.pkl")
 
-    try:
-        with open(model_path, 'wb') as file:
-            pickle.dump(model_fit, file)
-        print(f"\nTrained ARIMA model saved to: {model_path}")
-    except Exception as e:
-        print(f"Error saving model to {model_path}: {e}")
+    # Callbacks for early stopping and saving best models
+    early_stopping = EarlyStopping(monitor='val_loss', patience=patience, restore_best_weights=True)
+    checkpoint_reg = ModelCheckpoint(os.path.join(model_dir, f"lstm.h5"), monitor='val_loss', save_best_only=True) # Modified model save path to /models/{symbol}/lstm.h5
 
 
-# --- Main Program ---
-if __name__ == "__main__":
-    # --- MongoDB Connection Details ---
-    mongo_uri = "mongodb://localhost:27017/"
-    db_name = "stock_market_db"
-    collection_name = "stock_data"
-
-    stock_symbol_to_predict = "AAPL"
-    price_field_to_use = 'Close'
-
-    # --- Date Range for Training and Prediction ---
-    start_date_str = "2020-02-25"  # Original start date
-    end_date_str = "2025-02-25"   # Original end date
-
-    start_date = datetime.strptime(start_date_str, "%Y-%m-%d").date()
-    end_date = datetime.strptime(end_date_str, "%Y-%m-%d").date()
+    print(f"Training Regression Model for {symbol}...")
+    history_reg = model_reg.fit(X_train, y_train_reg, epochs=epochs, batch_size=batch_size, validation_split=0.1, callbacks=[early_stopping, checkpoint_reg], verbose=1)
 
 
-    try:
-        # 1. Load Data from MongoDB with Date Range and Feature Engineering
-        stock_series, feature_df = load_data_from_mongodb(mongo_uri, db_name, collection_name, stock_symbol_to_predict, price_field_to_use, start_date, end_date, feature_engineering=True)
+    # --- 6. Evaluate Models ---
+    print(f"\n--- Evaluation for {symbol} ---")
+    # Regression Evaluation
+    y_pred_reg = model_reg.predict(X_test)
+    # Inverse transform to get original scale
+    y_pred_reg_orig = scaler.inverse_transform(np.hstack([y_pred_reg, np.zeros((y_pred_reg.shape[0], scaled_data.shape[1]-1))]))[:, 0]
+    y_test_reg_orig = scaler.inverse_transform(np.hstack([y_test_reg.reshape(-1,1), np.zeros((y_test_reg.shape[0], scaled_data.shape[1]-1))]))[:, 0]
+    mse, rmse, mae, r2, mape = evaluate_regression(y_test_reg_orig, y_pred_reg_orig) # Get MAPE
 
-        # 2. Handle Stationarity (using 'Close' price series)
-        stationary_series, diff_order = make_stationary(stock_series.copy())
-        if stationary_series is None:
-            print("Failed to make series stationary. Exiting.")
-            exit()
+    # Classification Evaluation from Regression Model
+    # Get lagged prices for the test set corresponding to the regression predictions
+    y_lagged_test = data_filtered[f'Lagged_Return_{lag_days}'].values[train_size + seq_length:] # Adjusted index to align with test set and sequence length
+    y_pred_class_from_reg = create_classification_labels(y_pred_reg_orig, y_lagged_test)
 
-        # 3. Split Data (split the feature DataFrame as well to keep features aligned with target 'Close' price)
-        train_data, test_data = train_test_split(stationary_series)
-        original_train, original_test = train_test_split(stock_series) # Keep original_train, original_test although not directly used.
-
-        feature_train_df, feature_test_df = train_test_split(feature_df) # Split the feature-rich DataFrame
-
-        # 4. Automatically Set ARIMA Parameters (using AIC for stationary series)
-        best_order = get_auto_arima_params(train_data, max_p=3, max_q=3) # You can adjust max_p and max_q
-
-        # 5. Train ARIMA Model
-        arima_model_fit = train_arima_model(train_data, best_order)
-        if arima_model_fit is None:
-            exit()
-
-        # 6. Evaluate Model (includes classification metrics and model saving)
-        evaluate_model(arima_model_fit, train_data, test_data, stock_series, diff_order, stock_symbol_to_predict, best_order)
+    # --- Debugging Prints for Predictions and Labels ---
+    print("\n--- Debugging Prediction and Label Distributions ---")
+    print("Distribution of y_pred_class_from_reg:", pd.Series(y_pred_class_from_reg).value_counts())
+    print("Sample y_pred_class_from_reg:", y_pred_class_from_reg[:10])
+    print("Sample y_test_class:", y_test_class[:10])
+    print("Sample y_pred_reg_orig:", y_pred_reg_orig[:10])
+    print("Sample y_lagged_test:", y_lagged_test[:10])
 
 
-    except FileNotFoundError as e:
-        print(f"File Error: {e}")
-    except ValueError as e:
-        print(f"Value Error: {e}")
-    except Exception as e:
-        print(f"An error occurred: {e}")
+    accuracy, conf_matrix, class_report, sensitivity, specificity, precision, f1 = evaluate_classification(y_test_class, y_pred_class_from_reg) # Evaluate classification metrics
+
+
+    print(f"\n--- Model Evaluation Summary for {symbol} ---")
+    print(f"Regression Model Metrics:")
+    print(f"  RMSE: {rmse:.4f}, MAE: {mae:.4f}, MAPE: {mape:.2f}%, R-squared: {r2:.4f}") # Summarized Regression metrics
+    print(f"Classification Metrics (from Regression):")
+    print(f"  Accuracy: {accuracy:.4f}, Precision: {precision:.2f}, Sensitivity: {sensitivity:.2f}, Specificity: {specificity:.2f}, F1-Score: {f1:.2f}") # Summarized Classification metrics
+    print("\nConfusion Matrix (Classification from Regression):")
+    print(conf_matrix) # Print Confusion Matrix
+
+    # --- 7. Save Regression Model (already handled by ModelCheckpoint callback) ---
+    print(f"\nRegression model saved to: {os.path.join(model_dir, f'lstm.h5')}") # Inform user about save path
+
+
+if __name__ == '__main__':
+    symbol = "AAPL"
+    start_date = "2020-02-25"
+    end_date = "2025-02-25"
+    train_lstm_model(symbol, start_date, end_date, epochs=75, lstm_units = 60, patience=15) # example of more specific training
