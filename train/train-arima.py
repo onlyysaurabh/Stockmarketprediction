@@ -1,3 +1,4 @@
+# train-arima.py
 # modify the code to add date range to control how much data is used for training and prediction to make it less compute heavy
 import numpy as np
 import pandas as pd
