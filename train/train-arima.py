@@ -311,8 +311,8 @@ if __name__ == "__main__":
     price_field_to_use = 'Close'
 
     # --- Date Range for Training and Prediction ---
-    start_date_str = "2020-02-25"  # Original start date
-    end_date_str = "2023-02-25"   # Modified end date to reduce compute
+    start_date_str = "2020-02-28"  # Original start date
+    end_date_str = "2025-02-28"   # Modified end date to reduce compute
 
     start_date = datetime.strptime(start_date_str, "%Y-%m-%d").date()
     end_date = datetime.strptime(end_date_str, "%Y-%m-%d").date()
