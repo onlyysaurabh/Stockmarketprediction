@@ -256,14 +256,14 @@ def evaluate_model(model_fit, train_series, test_series, original_series, diff_o
 
 
     # Plotting Predictions vs Actual in Original Scale
-    plt.figure(figsize=(12, 6))
-    plt.plot(actuals_original_scale, label='Actual Prices', color='blue')
-    plt.plot(predictions_original_scale, label='Predicted Prices', color='red')
-    plt.title(f'ARIMA Model for {stock_symbol} - Actual vs Predicted Stock Prices') # Include stock symbol in title
-    plt.xlabel('Time')
-    plt.ylabel('Stock Price')
-    plt.legend()
-    plt.show()
+    # plt.figure(figsize=(12, 6))
+    # plt.plot(actuals_original_scale, label='Actual Prices', color='blue')
+    # plt.plot(predictions_original_scale, label='Predicted Prices', color='red')
+    # plt.title(f'ARIMA Model for {stock_symbol} - Actual vs Predicted Stock Prices') # Include stock symbol in title
+    # plt.xlabel('Time')
+    # plt.ylabel('Stock Price')
+    # plt.legend()
+    # plt.show()
 
     # --- Store Trained Model ---
     model_dir = f"models/{stock_symbol}"
@@ -311,8 +311,8 @@ if __name__ == "__main__":
     price_field_to_use = 'Close'
 
     # --- Date Range for Training and Prediction ---
-    start_date_str = "2020-02-28"  # Original start date
-    end_date_str = "2025-02-28"   # Modified end date to reduce compute
+    start_date_str = "2020-02-25"  # Original start date
+    end_date_str = "2025-02-25"   # Modified end date to reduce compute
 
     start_date = datetime.strptime(start_date_str, "%Y-%m-%d").date()
     end_date = datetime.strptime(end_date_str, "%Y-%m-%d").date()

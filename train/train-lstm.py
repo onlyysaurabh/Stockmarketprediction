@@ -109,7 +109,8 @@ def evaluate_classification(y_true, y_pred):
         sensitivity = tp / (tp + fn) if (tp + fn) > 0 else 0
         specificity = tn / (tn + fp) if (tn + fp) > 0 else 0
         precision = tp / (tp + fp) if (tp + fp) > 0 else 0
-        f1 = 2 * (precision * recall_score(y_true, y_pred, zero_division=0)) / (precision + recall_score(y_true, y_pred, zero_division=0)) if (precision + recall_score(y_true, y_pred, zero_division=0)) > 0 else 0
+        recall = recall_score(y_true, y_pred, zero_division=0)
+        f1 = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0
     else: # Handle cases with less than 2 classes in predictions
         print("Warning: Confusion matrix is not 2x2, possibly due to single class in y_true or y_pred.")
         tn, fp, fn, tp = 0, 0, 0, 0 # Set metrics to zero or handle as needed
@@ -120,9 +121,9 @@ def evaluate_classification(y_true, y_pred):
     print(f"  Accuracy: {accuracy:.4f}")
     print("  Confusion Matrix:\n", conf_matrix)
     print(f"  Sensitivity (Recall or True Positive Rate): {sensitivity:.2f}") # Added Sensitivity
-    print(f"  Specificity (True Negative Rate): {specificity:.2f}")     # Added Specificity
-    print(f"  Precision: {precision:.2f}")       # Added Precision
-    print(f"  F1-Score: {f1:.2f}")          # Added F1-Score
+    print(f"  Specificity (True Negative Rate): {specificity:.2f}")      # Added Specificity
+    print(f"  Precision: {precision:.2f}")          # Added Precision
+    print(f"  F1-Score: {f1:.2f}")              # Added F1-Score
     print("  Classification Report:\n", class_report)
     return accuracy, conf_matrix, class_report, sensitivity, specificity, precision, f1 # Return additional metrics
 
@@ -245,7 +246,7 @@ def train_lstm_model(symbol, start_date, end_date, evaluation_results_collection
     evaluation_metrics = {
         "stock_symbol": symbol,
         "start_date": start_date, # Keep as string for simplicity
-        "end_date": end_date,     # Keep as string for simplicity
+        "end_date": end_date,      # Keep as string for simplicity
         "seq_length": seq_length,
         "short_window": short_window,
         "long_window": long_window,
@@ -287,7 +288,7 @@ if __name__ == '__main__':
 
     # --- Date Range for Training and Prediction ---
     start_date_str = "2020-02-25" # Original start date
-    end_date_str = "2023-02-25"  # Modified end date for less compute
+    end_date_str = "2025-02-25"   # Modified end date for less compute
 
     start_date = datetime.datetime.strptime(start_date_str, "%Y-%m-%d").strftime("%Y-%m-%d") # Keep as string for yfinance
     end_date = datetime.datetime.strptime(end_date_str, "%Y-%m-%d").strftime("%Y-%m-%d")   # Keep as string for yfinance

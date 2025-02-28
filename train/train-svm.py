@@ -22,7 +22,9 @@ def load_data_from_mongodb(mongo_uri, db_name, collection_name, stock_symbol, st
 
         query = {"Symbol": stock_symbol}
         if start_date and end_date:
-            query["Date"] = {"$gte": start_date, "$lte": end_date}
+            # Use datetime objects for MongoDB query, not date objects
+            query["Date"] = {"$gte": datetime.combine(start_date, datetime.min.time()),
+                             "$lte": datetime.combine(end_date, datetime.max.time())}
 
         projection = {"Date": 1, "Close": 1, "Volume": 1, "_id": 0}
         sort = [("Date", pymongo.ASCENDING)]
@@ -134,20 +136,20 @@ def evaluate_model(model, X_test, y_test, close_scaler, stock_symbol, start_date
 
 
     # Plotting Predictions vs Actual in Original Scale
-    plt.figure(figsize=(12, 6))
-    plt.plot(y_test_orig, label='Actual Prices', color='blue')
-    plt.plot(y_pred_orig, label='Predicted Prices', color='red')
-    plt.title(f'SVM Model for {stock_symbol} - Actual vs Predicted Stock Prices') # Include stock symbol in title
-    plt.xlabel('Time')
-    plt.ylabel('Stock Price')
-    plt.legend()
-    plt.show()
+    #plt.figure(figsize=(12, 6))
+    #plt.plot(y_test_orig, label='Actual Prices', color='blue')
+    #plt.plot(y_pred_orig, label='Predicted Prices', color='red')
+    #plt.title(f'SVM Model for {stock_symbol} - Actual vs Predicted Stock Prices') # Include stock symbol in title
+    #plt.xlabel('Time')
+    #plt.ylabel('Stock Price')
+    #plt.legend()
+    #plt.show()
 
     # --- Store Evaluation Results in MongoDB ---
     evaluation_data = {
         "stock_symbol": stock_symbol,
-        "start_date": start_date.isoformat(),
-        "end_date": end_date.isoformat(),
+        "start_date": start_date.isoformat(),  # Store as ISO string
+        "end_date": end_date.isoformat(),      # Store as ISO string
         "svr_kernel": model.kernel,
         "svr_c": model.C,
         "svr_epsilon": model.epsilon,
@@ -200,8 +202,8 @@ if __name__ == "__main__":
     evaluation_collection_name = "svm_evaluation_results" # Collection for SVM results
 
     # --- Date Range for Training and Prediction ---
-    start_date_str = "2023-01-01" # Original start date
-    end_date_str = "2023-07-01"  # Modified end date to reduce data
+    start_date_str = "2020-02-25" # Original start date
+    end_date_str = "2025-02-25"  # Modified end date to reduce data
 
     start_date = datetime.strptime(start_date_str, "%Y-%m-%d").date()
     end_date = datetime.strptime(end_date_str, "%Y-%m-%d").date()
