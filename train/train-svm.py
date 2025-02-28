@@ -212,14 +212,14 @@ def evaluate_model(model, X_test, y_test, close_scaler, other_scaler, target_sca
         "svr_c": best_params.get('C', 1.0),
         "svr_epsilon": best_params.get('epsilon', 0.1),
         "svr_gamma": best_params.get('gamma', 'scale'),
-        "regression_mse": mse,
-        "regression_rmse": rmse,
-        "regression_mae": mae,
-        "regression_mape": mape,
-        "regression_r2": r2,
-        "classification_accuracy": accuracy,
-        "classification_confusion_matrix": conf_matrix.tolist() if conf_matrix.size > 0 else [],
-        "classification_report": class_report
+        "mse": mse,
+        "rmse": rmse,
+        "mae": mae,
+        "mape": mape,
+        "r2": r2,
+        "accuracy": accuracy,
+        "confusion_matrix": conf_matrix.tolist() if conf_matrix.size > 0 else [],
+        "report": class_report
     }
     try:
         evaluation_results_collection.insert_one(evaluation_data)
